@@ -438,6 +438,8 @@ class NetworkTrainer(object):
             self.print_to_log_file("\nepoch: ", self.epoch)
             epoch_start_time = time()
             train_losses_epoch = []
+            train_losses_epoch_seg = []
+            train_losses_epoch_mse = []
 
             # train one epoch
             self.network.train()
@@ -447,24 +449,29 @@ class NetworkTrainer(object):
                     for b in tbar:
                         tbar.set_description("Epoch {}/{}".format(self.epoch+1, self.max_num_epochs))
 
-                        l = self.run_iteration(self.tr_gen, True)
+                        l, loss_array = self.run_iteration(self.tr_gen, True)
 
                         tbar.set_postfix(loss=l)
                         train_losses_epoch.append(l)
+                        train_losses_epoch_seg.append(loss_array[0])
+                        train_losses_epoch_mse.append(loss_array[1])
+
             else:
                 for _ in range(self.num_batches_per_epoch):
-                    l = self.run_iteration(self.tr_gen, True)
+                    l, loss_array = self.run_iteration(self.tr_gen, True)
                     train_losses_epoch.append(l)
+                    train_losses_epoch_seg.append(loss_array[0])
+                    train_losses_epoch_mse.append(loss_array[1])
 
             self.all_tr_losses.append(np.mean(train_losses_epoch))
-            self.print_to_log_file("train loss : %.4f" % self.all_tr_losses[-1])
+            self.print_to_log_file("train loss : %.4f seg : %.4f laplace %.4f" % (self.all_tr_losses[-1],np.mean(train_losses_epoch_seg),np.mean(train_losses_epoch_mse)))
 
             with torch.no_grad():
                 # validation with train=False
                 self.network.eval()
                 val_losses = []
                 for b in range(self.num_val_batches_per_epoch):
-                    l = self.run_iteration(self.val_gen, False, True)
+                    l, loss_array = self.run_iteration(self.val_gen, False, True)
                     val_losses.append(l)
                 self.all_val_losses.append(np.mean(val_losses))
                 self.print_to_log_file("validation loss: %.4f" % self.all_val_losses[-1])
@@ -474,7 +481,7 @@ class NetworkTrainer(object):
                     # validation with train=True
                     val_losses = []
                     for b in range(self.num_val_batches_per_epoch):
-                        l = self.run_iteration(self.val_gen, False)
+                        l, loss_array = self.run_iteration(self.val_gen, False)
                         val_losses.append(l)
                     self.all_val_losses_tr_mode.append(np.mean(val_losses))
                     self.print_to_log_file("validation loss (train=True): %.4f" % self.all_val_losses_tr_mode[-1])
@@ -705,7 +712,7 @@ class NetworkTrainer(object):
 
         for batch_num in range(1, num_iters + 1):
             # +1 because this one here is not designed to have negative loss...
-            loss = self.run_iteration(self.tr_gen, do_backprop=True, run_online_evaluation=False).data.item() + 1
+            loss, loss_array  = self.run_iteration(self.tr_gen, do_backprop=True, run_online_evaluation=False).data.item() + 1
 
             # Compute the smoothed loss
             avg_loss = beta * avg_loss + (1 - beta) * loss

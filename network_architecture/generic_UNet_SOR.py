@@ -3,7 +3,6 @@
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
 #    You may obtain a copy of the License at
-#
 #        http://www.apache.org/licenses/LICENSE-2.0
 #
 #    Unless required by applicable law or agreed to in writing, software
@@ -20,7 +19,7 @@ import torch
 import numpy as np
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
-import torch.nn.functional
+import torch.nn.functional as F
 import nibabel as nib
 
 class ConvDropoutNormNonlin(nn.Module):
@@ -165,7 +164,7 @@ class Upsample(nn.Module):
 
 class SuccessiveOverRelaxation(nn.Module):
 
-    def __init__(self,source, sink,threshold = 1e-5, w = 1.5, max_iterations = 200):
+    def __init__(self,source, sink,threshold = 1e-5, w = 1.5, max_iterations = 80):
         super(SuccessiveOverRelaxation, self).__init__()
 
         """
@@ -175,8 +174,8 @@ class SuccessiveOverRelaxation(nn.Module):
         self.thresh = threshold
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.max_iterations = max_iterations
-        self.source_label = source
-        self.sink_label = sink
+        self.source = source
+        self.sink = sink
 
     def ravel_index(self,index, shape):
 
@@ -191,127 +190,89 @@ class SuccessiveOverRelaxation(nn.Module):
     def forward(self, image):
 
         """
-        image should be of size NxCxHxDxW where C is 1 and N can be greater than 1
+        image should be of size NxHxDxW where N can be greater than 1
         solver iterates through each image in the batch - is there a more efficient implementation? Concatenating between batches
         may result in computations across batches?
         """
-        
-        # Concatenate batches
-        img_list = list(image.squeeze())
-        bs = len(img_list)
-        img_list_padded = []
-        
-        # Pad each image for boundaries
-        for img in img_list:
-            im_shape_pad = [x + 2 for x in img.shape]
-            image_pad = torch.zeros(im_shape_pad).to(self.device)
-            image_pad[1:-1,1:-1,1:-1] = img
-            img_list_padded.append(image_pad)
-            
-        image = torch.cat(img_list_padded, axis = 0)
-        
-        h,w,d = image.shape
+        bs,c,h,w,d = image.shape
 
-        init = torch.zeros(image.shape).to(self.device)
+        #Initialize solver. WM is source, CSF is sink, GM is the region over which
+        # Laplacian is solved (initialize to 0.5)
+        init = 0.5*image[:,1,:] + 0*image[:,self.source,:] + 1*image[:,self.sink,:]
+        init = init.unsqueeze(1)
 
-        # For debbugging purposes
-        r = np.random.randint(200)
-        output_file = '/data/sadhanar/test_SOR_torch_batch' + str(r) + '.nii.gz'
-        nib.save(nib.Nifti1Image(image.cpu().numpy(), np.eye(4)),output_file)
-
-        #source
-        init[image == self.source_label ] = 0
-        #sink
-        init[image == self.sink_label] = 1
-        init_ravel = torch.flatten(init)
-        #print("Num sink pixels:", torch.sum(init_ravel))
-
+        #This should be the gm probability map, label 1
+        mask_gm = image[:,1,:].unsqueeze(1)
 
         #over-relaxation parameter
-        min_dim = torch.min(torch.tensor(image.shape)).type(torch.float32)
+        min_dim = torch.min(torch.tensor(init.shape)).type(torch.float32)
         self.wopt = 2/(1+(np.pi/min_dim))
 
-        # Black-red coordinates
-        black = torch.zeros([h,w,d])
-        red = torch.zeros([h,w,d])
-
-        xx,yy,zz = torch.meshgrid( torch.arange(0,h), torch.arange(0,w), torch.arange(0,d), indexing = 'ij')
+        #Black and red coordinate masks
+        xx,yy,zz = torch.meshgrid(torch.arange(0,h), torch.arange(0,w), torch.arange(0,d), indexing = 'ij')
         coords = xx + yy + zz
-        coords = coords.to(self.device)
-        black[(torch.fmod(coords,2) == 0) * (image == 1)] = 1
-        red[(torch.fmod(coords,2) == 1) * (image == 1)] = 1
+        coords = coords[None, None,:]
+        coords = coords.repeat([bs,1,1,1,1])
 
-        idx_black_gm = torch.stack(torch.where(black == 1))
-        idx_red_gm = torch.stack(torch.where(red == 1))
+        black = torch.zeros(coords.shape).to(self.device)
+        red = torch.zeros(coords.shape).to(self.device)
 
+        red[(torch.fmod(coords,2) == 0)] = 1
+        black[(torch.fmod(coords,2) == 1)] = 1
 
-        if ((idx_black_gm.numel() > 100) and (idx_red_gm.numel() > 100)):
+        iterations = 0
 
-            num_elements = idx_black_gm.numel() + idx_red_gm.numel()
-            black_ravel = self.ravel_index(idx_black_gm, image.shape)
-            red_ravel = self.ravel_index(idx_red_gm, image.shape)
+        #Weight kernel
+        w_xy = self.wopt/6
+        weight_kernel = torch.tensor([[[0,0,0],[0,w_xy,0],[0,0,0]],
+            [[0,w_xy,0],[w_xy,1-self.wopt,w_xy],[0,w_xy,0]],[[0,0,0],[0,w_xy,0],[0,0,0]]])
+        weight_kernel = weight_kernel[None, None, :].to(self.device)
 
-            gauss_seidel = torch.zeros(init_ravel.shape).to(self.device)
-            sor_adjustment = torch.zeros(init_ravel.shape).to(self.device)
-            iterations = 0
-            delta_v = 0
+        while(iterations < self.max_iterations):
 
-            while(True):
+            #Black step
+            half_step =  F.conv3d(init, weight_kernel, padding = 'same')
 
-                #black
-                gauss_seidel[black_ravel] = (init_ravel[black_ravel - 1]+ init_ravel[black_ravel + 1] + 
-                        init_ravel[black_ravel + d] +  init_ravel[black_ravel - d] + 
-                        init_ravel[black_ravel + d*w] +  init_ravel[black_ravel - d*w] - 6*init_ravel[black_ravel])/6
-                sor_adjustment[black_ravel] =self.wopt * gauss_seidel[black_ravel]
-                init_ravel[black_ravel] = sor_adjustment[black_ravel] + init_ravel[black_ravel]
-
-                delta_v += torch.sum(torch.abs(sor_adjustment[black_ravel]))
-
-                #red
-                gauss_seidel[red_ravel] = (init_ravel[red_ravel - 1]+ init_ravel[red_ravel + 1] +  init_ravel[red_ravel + d] +
-                             init_ravel[red_ravel - d] +  init_ravel[red_ravel + d*w] +  init_ravel[red_ravel - d*w] - 6*init_ravel[red_ravel])/6
-                sor_adjustment[red_ravel] = self.wopt * gauss_seidel[red_ravel]
-                init_ravel[red_ravel] = sor_adjustment[red_ravel] + init_ravel[red_ravel]
-
-                delta_v += torch.sum(torch.abs(sor_adjustment[red_ravel]))
-
-                iterations += 1
-
-                if delta_v < self.thresh:
-                    torch.set_printoptions(precision=4)
-                    print("Breaking: below threshold after", iterations, " iterations")
-                    if iterations == 1:
-                        chunk_size = (int(h/bs),)*bs
-                        init_list = torch.split(init,chunk_size, 0)
-                        init_cropped = [torch.unsqueeze(sol[1:-1,1:-1,1:-1],0) for sol in init_list]
-                        laplace_cropped = torch.stack(init_cropped)
-                    break
-                elif iterations > self.max_iterations:
-                    break
-                else:
-                    delta_v = 0  # Restart counting delta_v for the next iteration
-
-                laplace_sol = init_ravel.view(image.shape)
-                output_file = '/data/sadhanar/test_SORsolution' + str(r) + '.nii.gz'
-                nib.save(nib.Nifti1Image(laplace_sol.cpu().numpy(), np.eye(4)),output_file)
-
-                #Convert back into original input shape of N x C x H x D x W and remove padding
-                chunk_size = (int(h/bs),)*bs
-                laplace_list = torch.split(laplace_sol,chunk_size, 0)
-                laplace_cropped = [torch.unsqueeze(sol[1:-1,1:-1,1:-1],0) for sol in laplace_list]
-                laplace_cropped = torch.stack(laplace_cropped)
-
-            return laplace_cropped, iterations, delta_v
-
-        else:
-            print("not enough gray matter pixels to compute laplacian")
-            chunk_size = (int(h/bs),)*bs
-            init_list = torch.split(init,chunk_size, 0)
-            init_cropped = [torch.unsqueeze(sol[1:-1,1:-1,1:-1],0) for sol in init_list]
-            init_cropped = torch.stack(init_cropped)
+            #Combine black step with previous red step
+            half_step = half_step*black + init*red
             
-            return init_cropped,None, None
+            #Mask to retain only gray matter pixels
+            half_step = half_step*mask_gm + init*(torch.ones(mask_gm.shape).to(self.device) - mask_gm)
+            
+            full_step = F.conv3d(half_step, weight_kernel, padding = 'same')
+            
+            # Combine red solution and black solution before masking)
+            full_step = full_step*red + half_step*black
+            
+            #Only keep SOR solution within gm
+            full_step = full_step*mask_gm + init*(torch.ones(mask_gm.shape).to(self.device) - mask_gm)
+            
+            init = full_step
 
+            iterations += 1
+
+        return init, iterations
+
+"""
+def soft_argmax(image, beta = 100):
+    image = beta * image
+    image = softmax_helper(image)
+    C = image.shape[1]
+    
+    # Need to reshape the image for matrix multiplication
+    image = image.permute(1,0,2,3,4)
+    c,b,h,w,d = image.shape
+    image = image.reshape(C, -1)
+    
+    # Create indices 0:C to get the label approximatio
+    indices = torch.arange(C).to(torch.device("cuda:0" if torch.cuda.is_available() else "cpu"))
+    indices = indices.view(1,-1).float()
+    
+    output = torch.matmul(indices, image)
+    output = output.view(b,1,h,w,d).float()
+
+    return output
+"""
 
 class Generic_UNet_SOR(SegmentationNetwork):
     DEFAULT_BATCH_SIZE_3D = 2
@@ -353,7 +314,7 @@ class Generic_UNet_SOR(SegmentationNetwork):
         self.convolutional_upsampling = convolutional_upsampling
         self.convolutional_pooling = convolutional_pooling
         self.upscale_logits = upscale_logits
-        
+
         if nonlin_kwargs is None:
             nonlin_kwargs = {'negative_slope': 1e-2, 'inplace': True}
         if dropout_op_kwargs is None:
@@ -437,7 +398,7 @@ class Generic_UNet_SOR(SegmentationNetwork):
             if not self.convolutional_pooling:
                 self.td.append(pool_op(pool_op_kernel_sizes[d]))
             input_features = output_features
-            output_features = int(np.round(output_features * feat_map_mul_on_downscale)) 
+            output_features = int(np.round(output_features * feat_map_mul_on_downscale))
             output_features = min(output_features, self.max_num_features)
 
         # now the bottleneck.
@@ -538,8 +499,8 @@ class Generic_UNet_SOR(SegmentationNetwork):
         self.source_label = sor_source_label
         self.sink_label = sor_sink_label
         self.sor_start_epoch = sor_start_epoch
-        self.sor_module = SuccessiveOverRelaxation(source = self.source_label, sink = self.sink_label) 
-       
+        self.sor_module = SuccessiveOverRelaxation(source = self.source_label, sink = self.sink_label)
+
     def update_epoch(self, epoch):
         self.current_epoch = epoch
         if self.current_epoch > self.sor_start_epoch:
@@ -565,22 +526,33 @@ class Generic_UNet_SOR(SegmentationNetwork):
         if self._deep_supervision and self.do_ds and not self.compute_sor:
             return tuple([seg_outputs[-1]] + [i(j) for i, j in
                                               zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
-        
+
         elif self._deep_supervision and self.do_ds and self.compute_sor:
 
-#            #Convert prediction to a label image - Still need to apply final non-linearity
-            output_softmax = softmax_helper(seg_outputs[-1])
-            output_seg = output_softmax.argmax(1)
+            #Convert prediction to a label image - Still need to apply final non-linearity
+            seg_output_clone = seg_outputs[-1].clone()
+           
+            """
+            seg = softmax_helper(seg_outputs[-1])
+            seg = seg.argmax(1)
+            output_file = '/data/sadhanar/test_SOR_inputseg_argmax.nii.gz'
+            seg = torch.swapaxes(seg.squeeze(),0,3).float()
+            nib.save(nib.Nifti1Image(seg.detach().cpu().numpy(), np.eye(4)),output_file)
+            """
+
+            #Skip this step for now
+            #Soft argmax to get the predicted segmentaion labels. Argmax is not differentialable so 
+            # use an approximation
+            #output_seg = soft_argmax(seg_output_clone)
 
             # Compute laplacian solution
-            laplace_field, _, _ = self.sor_module(output_seg)
-            
+            seg_output_softmax = softmax_helper(seg_output_clone*100)
+            laplace_field, _ = self.sor_module(seg_output_softmax)
+
             return tuple([laplace_field] + [seg_outputs[-1]] + [i(j) for i, j in
                                               zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
         else:
 
-            #Should add the laplacian map output here as well. Would need to fix up validate function though so it 
-            # doesn't crash - multiple nested functions
             return seg_outputs[-1]
 
     @staticmethod
