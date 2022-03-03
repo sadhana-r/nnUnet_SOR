@@ -44,7 +44,7 @@ def get_moreDA_augmentation(dataloader_train, dataloader_val, patch_size, params
                             seeds_train=None, seeds_val=None, order_seg=1, order_data=3, deep_supervision_scales=None,
                             soft_ds=False,
                             classes=None, pin_memory=True, regions=None,
-                            use_nondetMultiThreadedAugmenter: bool = False):
+                            use_nondetMultiThreadedAugmenter: bool = False, laplace_seg: bool = False):
     assert params.get('mirror') is None, "old version of params, use new keyword do_mirror"
 
     tr_transforms = []
@@ -81,7 +81,7 @@ def get_moreDA_augmentation(dataloader_train, dataloader_val, patch_size, params
         independent_scale_for_each_axis=params.get("independent_scale_factor_for_each_axis")
     ))
 
-    tr_transforms.append(MoveLaplaceToSeg(1))
+    tr_transforms.append(MoveLaplaceToSeg(1, laplace_seg = laplace_seg))
 
     if params.get("dummy_2D"):
         tr_transforms.append(Convert2DTo3DTransform())
@@ -182,7 +182,7 @@ def get_moreDA_augmentation(dataloader_train, dataloader_val, patch_size, params
         val_transforms.append(SegChannelSelectionTransform(params.get("selected_seg_channels")))
 
     # Added by SR
-    val_transforms.append(MoveLaplaceToSeg(1))
+    val_transforms.append(MoveLaplaceToSeg(1, laplace_seg = laplace_seg))
 
     if params.get("move_last_seg_chanel_to_data") is not None and params.get("move_last_seg_chanel_to_data"):
         val_transforms.append(MoveSegAsOneHotToData(1, params.get("all_segmentation_labels"), 'seg', 'data'))

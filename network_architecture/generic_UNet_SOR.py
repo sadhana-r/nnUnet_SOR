@@ -164,7 +164,7 @@ class Upsample(nn.Module):
 
 class SuccessiveOverRelaxation(nn.Module):
 
-    def __init__(self,source, sink,threshold = 1e-5, w = 1.5, max_iterations = 80):
+    def __init__(self,source, sink,threshold = 1e-5, w = 1.5, max_iterations = 60):
         super(SuccessiveOverRelaxation, self).__init__()
 
         """
@@ -300,7 +300,7 @@ class Generic_UNet_SOR(SegmentationNetwork):
                  conv_kernel_sizes=None,
                  upscale_logits=False, convolutional_pooling=False, convolutional_upsampling=False,
                  max_num_features=None, basic_block=ConvDropoutNormNonlin,
-                 seg_output_use_bias=False, sor_start_epoch = 10, sor_source_label = None, sor_sink_label = None):
+                 seg_output_use_bias=False, sor_start_epoch = 10, sor_source_label = None, sor_sink_label = None, sor_num_iterations = 60):
         """
         basically more flexible than v1, architecture is the same
 
@@ -499,7 +499,8 @@ class Generic_UNet_SOR(SegmentationNetwork):
         self.source_label = sor_source_label
         self.sink_label = sor_sink_label
         self.sor_start_epoch = sor_start_epoch
-        self.sor_module = SuccessiveOverRelaxation(source = self.source_label, sink = self.sink_label)
+        self.sor_num_iterations = sor_num_iterations
+        self.sor_module = SuccessiveOverRelaxation(source = self.source_label, sink = self.sink_label, max_iterations = self.sor_num_iterations)
 
     def update_epoch(self, epoch):
         self.current_epoch = epoch
