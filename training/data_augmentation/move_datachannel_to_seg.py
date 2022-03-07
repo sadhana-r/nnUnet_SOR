@@ -20,13 +20,15 @@ def doublesigmoid_threshold(data, lower_lim, upper_lim):
 
 def convert_laplacian_toseg(data):
     
-    thresholds = [-0.1,0.1, 0.3, 0.5, 0.7, 0.9] 
-    result = torch.zeros((data.shape[0],len(thresholds), *data.shape[2:]), dtype=data.dtype) 
+    data = torch.from_numpy(data)
+    thresholds = [-0.1,0.1, 0.3, 0.5, 0.7, 0.9]
+    shape = (data.shape[0],len(thresholds), *data.shape[2:])
+    result = torch.zeros(shape, dtype=data.dtype) 
     for i, l in enumerate(thresholds): 
         output = doublesigmoid_threshold(data, l,l+0.3)
         result[:,i] = output
                 
-    return result
+    return result.numpy()
 
 class MoveLaplaceToSeg(AbstractTransform):
         '''
@@ -37,6 +39,7 @@ class MoveLaplaceToSeg(AbstractTransform):
             self.key_target = key_target
             self.key_origin = key_origin
             self.channel_id = channel_id
+            self.laplace_seg = laplace_seg
 
         def __call__(self, **data_dict):
             origin = data_dict.get(self.key_origin)
@@ -44,10 +47,11 @@ class MoveLaplaceToSeg(AbstractTransform):
             laplace = origin[:,self.channel_id]
             laplace = np.expand_dims(laplace, 1)
 
-            if laplace_seg:
+            if self.laplace_seg:
                 #Convert to seg one hot
                 laplace_onehot = convert_laplacian_toseg(laplace)
                 laplace_multilabel = laplace_onehot.argmax(1)
+                laplace_multilabel = laplace_multilabel[:,None, :]
                 target = np.concatenate((target, laplace_multilabel), 1)
             
             else:

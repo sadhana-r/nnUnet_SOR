@@ -15,13 +15,19 @@
 
 from collections import OrderedDict
 from typing import Tuple
+from multiprocessing import Pool
+from nnunet.configuration import default_num_threads
+import shutil
 
+from nnunet.evaluation.evaluator import aggregate_scores
 import numpy as np
 import torch
 from nnunet.training.data_augmentation.data_augmentation_moreDA_SOR import get_moreDA_augmentation
 from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2_SOR
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
+from nnunet.inference.segmentation_export import save_segmentation_nifti_from_softmax
+from nnunet.postprocessing.connected_components import determine_postprocessing
 from nnunet.network_architecture.generic_UNet_SOR import Generic_UNet_SOR
 from nnunet.network_architecture.initialization import InitWeights_He
 from nnunet.network_architecture.neural_network import SegmentationNetwork
@@ -138,7 +144,7 @@ class nnUNetTrainerV2_SOR_exp3(nnUNetTrainer):
                     self.data_aug_params,
                     deep_supervision_scales=self.deep_supervision_scales,
                     pin_memory=self.pin_memory,
-                    use_nondetMultiThreadedAugmenter=False
+                    use_nondetMultiThreadedAugmenter=False, laplace_seg = True
                 )
                 self.print_to_log_file("TRAINING KEYS:\n %s" % (str(self.dataset_tr.keys())),
                                        also_print_to_console=False)
@@ -196,7 +202,7 @@ class nnUNetTrainerV2_SOR_exp3(nnUNetTrainer):
                                     dropout_op_kwargs,
                                     net_nonlin, net_nonlin_kwargs, True, False, lambda x: x, InitWeights_He(1e-2),
                                     self.net_num_pool_op_kernel_sizes, self.net_conv_kernel_sizes, False, True, True,
-                                    sor_start_epoch = self.sor_start_epoch, sor_source_label =  source_label_SOR, sor_sink_label = sink_label_SOR)
+                                    sor_start_epoch = self.sor_start_epoch, sor_source_label =  source_label_SOR, sor_sink_label = sink_label_SOR, sor_num_iterations = 40)
 
         if torch.cuda.is_available():
             self.network.cuda()
@@ -220,45 +226,252 @@ class nnUNetTrainerV2_SOR_exp3(nnUNetTrainer):
         output = output[0]
         return super().run_online_evaluation(output, target)
 
+    def predict_preprocessed_data_return_seg_and_softmax(self, data: np.ndarray, do_mirroring: bool = True,
+                                                     mirror_axes: Tuple[int] = None,
+                                                     use_sliding_window: bool = True, step_size: float = 0.5,
+                                                     use_gaussian: bool = True, pad_border_mode: str = 'constant',
+                                                     pad_kwargs: dict = None, all_in_gpu: bool = False,
+                                                     verbose: bool = True, mixed_precision: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+
+        """
+        :param data:
+        :param do_mirroring:
+        :param mirror_axes:
+        :param use_sliding_window:
+        :param step_size:
+        :param use_gaussian:
+        :param pad_border_mode:
+        :param pad_kwargs:
+        :param all_in_gpu:
+        :param verbose:
+        :return:
+        """
+
+        ds = self.network.do_ds
+        self.network.do_ds = False
+
+        if pad_border_mode == 'constant' and pad_kwargs is None:
+            pad_kwargs = {'constant_values': 0}
+
+        if do_mirroring and mirror_axes is None:
+            mirror_axes = self.data_aug_params['mirror_axes']
+
+        if do_mirroring:
+            assert self.data_aug_params["do_mirror"], "Cannot do mirroring as test time augmentation when training " \
+                                                      "was done without mirroring"
+
+        valid = list((SegmentationNetwork, nn.DataParallel))
+        assert isinstance(self.network, tuple(valid))
+
+        current_mode = self.network.training
+        self.network.eval()
+        ret = self.network.predict_3D(data, do_mirroring=do_mirroring, mirror_axes=mirror_axes,
+                                      use_sliding_window=use_sliding_window, step_size=step_size,
+                                      patch_size=self.patch_size, regions_class_order=self.regions_class_order,
+                                      use_gaussian=use_gaussian, pad_border_mode=pad_border_mode,
+                                      pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu, verbose=verbose,
+                                      mixed_precision=mixed_precision, include_laplace = True)
+        self.network.train(current_mode)
+
+        self.network.do_ds = ds
+
+        return ret
+
+    def internal_validate(self, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
+                 save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
+                 validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
+        """
+        if debug=True then the temporary files generated for postprocessing determination will be kept
+        """
+
+
+        current_mode = self.network.training
+        self.network.eval()
+
+        assert self.was_initialized, "must initialize, ideally with checkpoint (or train first)"
+        if self.dataset_val is None:
+            self.load_dataset()
+            self.do_split()
+
+        if segmentation_export_kwargs is None:
+            if 'segmentation_export_params' in self.plans.keys():
+                force_separate_z = self.plans['segmentation_export_params']['force_separate_z']
+                interpolation_order = self.plans['segmentation_export_params']['interpolation_order']
+                interpolation_order_z = self.plans['segmentation_export_params']['interpolation_order_z']
+            else:
+                force_separate_z = None
+                interpolation_order = 1
+                interpolation_order_z = 0
+        else:
+            force_separate_z = segmentation_export_kwargs['force_separate_z']
+            interpolation_order = segmentation_export_kwargs['interpolation_order']
+            interpolation_order_z = segmentation_export_kwargs['interpolation_order_z']
+
+        # predictions as they come from the network go here
+        output_folder = join(self.output_folder, validation_folder_name)
+        output_folder_laplace = join(self.output_folder, 'validation_raw_laplacians')
+        maybe_mkdir_p(output_folder)
+        maybe_mkdir_p(output_folder_laplace)
+        # this is for debug purposes
+        my_input_args = {'do_mirroring': do_mirroring,
+                         'use_sliding_window': use_sliding_window,
+                         'step_size': step_size,
+                         'save_softmax': save_softmax,
+                         'use_gaussian': use_gaussian,
+                         'overwrite': overwrite,
+                         'validation_folder_name': validation_folder_name,
+                         'debug': debug,
+                         'all_in_gpu': all_in_gpu,
+                         'segmentation_export_kwargs': segmentation_export_kwargs,
+                         }
+        save_json(my_input_args, join(output_folder, "validation_args.json"))
+
+        if do_mirroring:
+            if not self.data_aug_params['do_mirror']:
+                raise RuntimeError("We did not train with mirroring so you cannot do inference with mirroring enabled")
+            mirror_axes = self.data_aug_params['mirror_axes']
+        else:
+            mirror_axes = ()
+
+        pred_gt_tuples = []
+
+        export_pool = Pool(default_num_threads)
+        results = []
+
+        for k in self.dataset_val.keys():
+            properties = load_pickle(self.dataset[k]['properties_file'])
+            fname = properties['list_of_data_files'][0].split("/")[-1][:-12]
+            if overwrite or (not isfile(join(output_folder, fname + ".nii.gz"))) or \
+                    (save_softmax and not isfile(join(output_folder, fname + ".npz"))):
+                data = np.load(self.dataset[k]['data_file'])['data']
+
+                print(k, data.shape)
+                data[-1][data[-1] == -1] = 0
+
+                #SR change this. Remove last two channels
+                print("SR debug: Ignoring laplacian channel in data")
+                image = data[:-2]
+
+                #softmax_pred is now a list containing both the segmentation and laplacian probability map
+                softmax_pred_list = self.predict_preprocessed_data_return_seg_and_softmax(image,
+                                                                                     do_mirroring=do_mirroring,
+                                                                                     mirror_axes=mirror_axes,
+                                                                                     use_sliding_window=use_sliding_window,
+                                                                                     step_size=step_size,
+                                                                                     use_gaussian=use_gaussian,
+                                                                                     all_in_gpu=all_in_gpu,
+                                                                                     mixed_precision=self.fp16)[1]
+
+
+                softmax_pred = softmax_pred_list[0].transpose([0] + [i + 1 for i in self.transpose_backward])
+                softmax_laplace = softmax_pred_list[1].transpose([0] + [i + 1 for i in self.transpose_backward])
+
+                if save_softmax:
+                    softmax_fname = join(output_folder, fname + ".npz")
+                    laplace_fname = join(output_folder_laplace, fname + "laplace.npz")
+                else:
+                    softmax_fname = None
+                    laplace_fname = None
+
+                """There is a problem with python process communication that prevents us from communicating obejcts
+                larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
+                communicated by the multiprocessing.Pipe object then the placeholder (\%i I think) does not allow for long
+                enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
+                patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
+                then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
+                filename or np.ndarray and will handle this automatically"""
+                if np.prod(softmax_pred.shape) > (2e9 / 4 * 0.85):  # *0.85 just to be save
+                    np.save(join(output_folder, fname + ".npy"), softmax_pred)
+                    softmax_pred = join(output_folder, fname + ".npy")
+
+                results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                                                         ((softmax_pred, join(output_folder, fname + ".nii.gz"),
+                                                           properties, interpolation_order, self.regions_class_order,
+                                                           None, None,
+                                                           softmax_fname, None, force_separate_z,
+                                                           interpolation_order_z),
+                                                          )
+                                                         )
+                               )
+
+                results.append(export_pool.starmap_async(save_segmentation_nifti_from_softmax,
+                    ((softmax_laplace, join(output_folder_laplace, fname + "laplace.nii.gz"),
+                        properties, interpolation_order, self.regions_class_order,
+                        None, None, laplace_fname, None, force_separate_z,
+                        interpolation_order_z),)))
+
+            pred_gt_tuples.append([join(output_folder, fname + ".nii.gz"),
+                                   join(self.gt_niftis_folder, fname + ".nii.gz")])
+
+        _ = [i.get() for i in results]
+        self.print_to_log_file("finished prediction")
+
+        # evaluate raw predictions
+        self.print_to_log_file("evaluation of raw predictions")
+        task = self.dataset_directory.split("/")[-1]
+        job_name = self.experiment_name
+        _ = aggregate_scores(pred_gt_tuples, labels=list(range(self.num_classes)),
+                             json_output_file=join(output_folder, "summary.json"),
+                             json_name=job_name + " val tiled %s" % (str(use_sliding_window)),
+                             json_author="Fabian",
+                             json_task=task, num_threads=default_num_threads)
+
+        if run_postprocessing_on_folds:
+            # in the old nnunet we would stop here. Now we add a postprocessing. This postprocessing can remove everything
+            # except the largest connected component for each class. To see if this improves results, we do this for all
+            # classes and then rerun the evaluation. Those classes for which this resulted in an improved dice score will
+            # have this applied during inference as well
+            self.print_to_log_file("determining postprocessing")
+            determine_postprocessing(self.output_folder, self.gt_niftis_folder, validation_folder_name,
+                                     final_subf_name=validation_folder_name + "_postprocessed", debug=debug)
+            # after this the final predictions for the vlaidation set can be found in validation_folder_name_base + "_postprocessed"
+            # They are always in that folder, even if no postprocessing as applied!
+
+        # detemining postprocesing on a per-fold basis may be OK for this fold but what if another fold finds another
+        # postprocesing to be better? In this case we need to consolidate. At the time the consolidation is going to be
+        # done we won't know what self.gt_niftis_folder was, so now we copy all the niftis into a separate folder to
+        # be used later
+        gt_nifti_folder = join(self.output_folder_base, "gt_niftis")
+        maybe_mkdir_p(gt_nifti_folder)
+        for f in subfiles(self.gt_niftis_folder, suffix=".nii.gz"):
+            success = False
+            attempts = 0
+            e = None
+            while not success and attempts < 10:
+                try:
+                    shutil.copy(f, gt_nifti_folder)
+                    success = True
+                except OSError as e:
+                    attempts += 1
+                    sleep(1)
+            if not success:
+                print("Could not copy gt nifti file %s into folder %s" % (f, gt_nifti_folder))
+                if e is not None:
+                    raise e
+
+        self.network.train(current_mode)
+
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True,
                  step_size: float = 0.5, save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, includes_laplacian: bool = False):
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
         """
         We need to wrap this because we need to enforce self.network.do_ds = False for prediction
         """
         ds = self.network.do_ds
-        self.network.do_ds = False
+        sor = self.network.compute_sor
 
-        ret = super().validate(do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
+        self.network.do_ds = False
+        self.network.compute_sor = True
+
+        laplacian = True
+        ret = self.internal_validate(do_mirroring=do_mirroring, use_sliding_window=use_sliding_window, step_size=step_size,
                                save_softmax=save_softmax, use_gaussian=use_gaussian,
                                overwrite=overwrite, validation_folder_name=validation_folder_name, debug=debug,
                                all_in_gpu=all_in_gpu, segmentation_export_kwargs=segmentation_export_kwargs,
-                               run_postprocessing_on_folds=run_postprocessing_on_folds, includes_laplacian = True)
-
-        self.network.do_ds = ds
-        return ret
-
-    def predict_preprocessed_data_return_seg_and_softmax(self, data: np.ndarray, do_mirroring: bool = True,
-                                                         mirror_axes: Tuple[int] = None,
-                                                         use_sliding_window: bool = True, step_size: float = 0.5,
-                                                         use_gaussian: bool = True, pad_border_mode: str = 'constant',
-                                                         pad_kwargs: dict = None, all_in_gpu: bool = False,
-                                                         verbose: bool = True, mixed_precision=True) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        We need to wrap this because we need to enforce self.network.do_ds = False for prediction
-        """
-        ds = self.network.do_ds
-        self.network.do_ds = False
-        ret = super().predict_preprocessed_data_return_seg_and_softmax(data,
-                                                                       do_mirroring=do_mirroring,
-                                                                       mirror_axes=mirror_axes,
-                                                                       use_sliding_window=use_sliding_window,
-                                                                       step_size=step_size, use_gaussian=use_gaussian,
-                                                                       pad_border_mode=pad_border_mode,
-                                                                       pad_kwargs=pad_kwargs, all_in_gpu=all_in_gpu,
-                                                                       verbose=verbose,
-                                                                       mixed_precision=mixed_precision)
+                               run_postprocessing_on_folds=run_postprocessing_on_folds)
+        self.network.compute_sor = sor
         self.network.do_ds = ds
         return ret
 
@@ -328,7 +541,7 @@ class nnUNetTrainerV2_SOR_exp3(nnUNetTrainer):
 
         # BY SR
         if self.epoch > self.sor_start_epoch:
-            output = output[1:]
+            output = output[2:]
 
         target = target[1:]
 

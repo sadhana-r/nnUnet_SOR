@@ -162,9 +162,31 @@ class Upsample(nn.Module):
         return nn.functional.interpolate(x, size=self.size, scale_factor=self.scale_factor, mode=self.mode,
                                          align_corners=self.align_corners)
 
+
+def doublesigmoid_threshold(data, lower_lim, upper_lim):
+    steepness = 10
+
+    lower_thresh = 1/(1 + torch.exp(-steepness*(data - lower_lim)))
+    upper_thresh = 1/(1 + torch.exp(steepness*(data - upper_lim)))
+
+    output = torch.mul(lower_thresh,upper_thresh)
+    output = output.squeeze()
+
+    return output
+
+def convert_laplacian_toseg(data, thresholds):
+
+    result = torch.zeros((data.shape[0],len(thresholds), *data.shape[2:]), dtype=data.dtype)
+    for i, l in enumerate(thresholds):
+        output = doublesigmoid_threshold(data,l,l+0.3)
+        result[:,i] = output
+
+    return result.cuda()
+
+
 class SuccessiveOverRelaxation(nn.Module):
 
-    def __init__(self,source, sink,threshold = 1e-5, w = 1.5, max_iterations = 60):
+    def __init__(self,source, sink,threshold = 1e-5, w = 1.5, max_iterations = 60, thresholds = [-0.1,0.1, 0.3, 0.5, 0.7, 0.9]):
         super(SuccessiveOverRelaxation, self).__init__()
 
         """
@@ -176,16 +198,7 @@ class SuccessiveOverRelaxation(nn.Module):
         self.max_iterations = max_iterations
         self.source = source
         self.sink = sink
-
-    def ravel_index(self,index, shape):
-
-        [dim1,dim2,dim3] = shape
-        out = []
-        for i in range(index.shape[1]):
-            out.append((dim2*dim3)*index[0,i] +
-            dim3*index[1,i] + index[2,i])
-
-        return torch.stack(out)
+        self.thresholds = thresholds
 
     def forward(self, image):
 
@@ -195,6 +208,14 @@ class SuccessiveOverRelaxation(nn.Module):
         may result in computations across batches?
         """
         bs,c,h,w,d = image.shape
+
+        if torch.isnan(image).any():
+            print("input image contains nan:", torch.isnan(image).any())
+            
+            for i in range(bs):
+                output_file = '/data/sadhanar/SOR_input_debugnan' + str(i) + '.nii.gz'
+                save_img = torch.swapaxes(image[i,:].squeeze(),0,3).float()
+                nib.save(nib.Nifti1Image(save_img.detach().cpu().numpy(), np.eye(4)),output_file)
 
         #Initialize solver. WM is source, CSF is sink, GM is the region over which
         # Laplacian is solved (initialize to 0.5)
@@ -245,13 +266,19 @@ class SuccessiveOverRelaxation(nn.Module):
             full_step = full_step*red + half_step*black
             
             #Only keep SOR solution within gm
+            if torch.isnan(full_step).any():
+                print("full step contains nan:", torch.isnan(full_step).any())
+            if torch.isnan(init).any():
+                print("init contains nan:", torch.isnan(init).any())
             full_step = full_step*mask_gm + init*(torch.ones(mask_gm.shape).to(self.device) - mask_gm)
             
             init = full_step
 
             iterations += 1
 
-        return init, iterations
+        laplace_onehot = convert_laplacian_toseg(init, self.thresholds)
+
+        return init, laplace_onehot
 
 """
 def soft_argmax(image, beta = 100):
@@ -300,7 +327,7 @@ class Generic_UNet_SOR(SegmentationNetwork):
                  conv_kernel_sizes=None,
                  upscale_logits=False, convolutional_pooling=False, convolutional_upsampling=False,
                  max_num_features=None, basic_block=ConvDropoutNormNonlin,
-                 seg_output_use_bias=False, sor_start_epoch = 10, sor_source_label = None, sor_sink_label = None, sor_num_iterations = 60):
+                 seg_output_use_bias=False, sor_start_epoch = 10, sor_source_label = None, sor_sink_label = None, sor_num_iterations = 60, compute_sor = False):
         """
         basically more flexible than v1, architecture is the same
 
@@ -495,11 +522,13 @@ class Generic_UNet_SOR(SegmentationNetwork):
 
         # Added by SR
         self.current_epoch = 0
-        self.compute_sor = False
+        self.compute_sor = compute_sor
         self.source_label = sor_source_label
         self.sink_label = sor_sink_label
         self.sor_start_epoch = sor_start_epoch
         self.sor_num_iterations = sor_num_iterations
+        self.thresholds =  [-0.1,0.1, 0.3, 0.5, 0.7, 0.9]
+        self.num_thresholds = len(self.thresholds)
         self.sor_module = SuccessiveOverRelaxation(source = self.source_label, sink = self.sink_label, max_iterations = self.sor_num_iterations)
 
     def update_epoch(self, epoch):
@@ -528,30 +557,24 @@ class Generic_UNet_SOR(SegmentationNetwork):
             return tuple([seg_outputs[-1]] + [i(j) for i, j in
                                               zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
 
-        elif self._deep_supervision and self.do_ds and self.compute_sor:
+        elif self.compute_sor:
 
             #Convert prediction to a label image - Still need to apply final non-linearity
             seg_output_clone = seg_outputs[-1].clone()
-           
-            """
-            seg = softmax_helper(seg_outputs[-1])
-            seg = seg.argmax(1)
-            output_file = '/data/sadhanar/test_SOR_inputseg_argmax.nii.gz'
-            seg = torch.swapaxes(seg.squeeze(),0,3).float()
-            nib.save(nib.Nifti1Image(seg.detach().cpu().numpy(), np.eye(4)),output_file)
-            """
-
-            #Skip this step for now
-            #Soft argmax to get the predicted segmentaion labels. Argmax is not differentialable so 
-            # use an approximation
-            #output_seg = soft_argmax(seg_output_clone)
 
             # Compute laplacian solution
             seg_output_softmax = softmax_helper(seg_output_clone*100)
-            laplace_field, _ = self.sor_module(seg_output_softmax)
+            laplace_field, laplace_onehot  = self.sor_module(seg_output_softmax)
 
-            return tuple([laplace_field] + [seg_outputs[-1]] + [i(j) for i, j in
-                                              zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
+            if self._deep_supervision and self.do_ds:
+
+                return tuple([laplace_field] + [laplace_onehot] + [seg_outputs[-1]] + [i(j) for i, j in
+                    zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])])
+        
+            else:
+
+                return tuple([seg_outputs[-1]] + [laplace_onehot])
+
         else:
 
             return seg_outputs[-1]

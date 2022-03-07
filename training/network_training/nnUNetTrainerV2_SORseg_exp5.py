@@ -23,7 +23,7 @@ from nnunet.evaluation.evaluator import aggregate_scores
 import numpy as np
 import torch
 from nnunet.training.data_augmentation.data_augmentation_moreDA_SOR import get_moreDA_augmentation
-from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2_SOR, MultipleOutputLoss2_SOR_DSC
+from nnunet.training.loss_functions.deep_supervision import MultipleOutputLoss2_SOR, MultipleOutputLoss2_SOR_DSC_only
 from nnunet.training.loss_functions.dice_loss import DC_and_CE_loss
 from nnunet.utilities.to_torch import maybe_to_torch, to_cuda
 from nnunet.inference.segmentation_export import save_segmentation_nifti_from_softmax
@@ -45,7 +45,7 @@ from batchgenerators.utilities.file_and_folder_operations import *
 
 import nibabel as nib
 
-class nnUNetTrainerV2_SORseg_exp4(nnUNetTrainer):
+class nnUNetTrainerV2_SORseg_exp5(nnUNetTrainer):
     """
     Info for Fabian: same as internal nnUNetTrainerV2_2
     """
@@ -63,7 +63,7 @@ class nnUNetTrainerV2_SORseg_exp4(nnUNetTrainer):
 
         # Added by SR
         self.batch_dice = batch_dice
-        self.sor_start_epoch= 9
+        self.sor_start_epoch= -1
 
     def get_SOR_generators(self, oversample_foreground_percent = 1):
         self.load_dataset()
@@ -121,7 +121,7 @@ class nnUNetTrainerV2_SORseg_exp4(nnUNetTrainer):
             self.ds_loss_weights = weights
             # now wrap the loss
             self.loss = DC_and_CE_loss({'batch_dice': self.batch_dice, 'smooth': 1e-5, 'do_bg': False}, {}, ignore_label = 0)
-            self.loss = MultipleOutputLoss2_SOR_DSC(self.loss, self.ds_loss_weights, self.sor_start_epoch, lambda_weight = 0.5)
+            self.loss = MultipleOutputLoss2_SOR_DSC_only(self.loss, self.ds_loss_weights)
             ################# END ###################
 
             self.folder_with_preprocessed_data = join(self.dataset_directory, self.plans['data_identifier'] +
@@ -514,7 +514,7 @@ class nnUNetTrainerV2_SORseg_exp4(nnUNetTrainer):
                 output = self.network(data)
                 del data
 
-                l, loss_array  = self.loss(output, target,self.epoch)
+                l, loss_array  = self.loss(output, target)
 
             if do_backprop:
                 self.amp_grad_scaler.scale(l).backward()
@@ -525,7 +525,7 @@ class nnUNetTrainerV2_SORseg_exp4(nnUNetTrainer):
         else:
             output = self.network(data)
             del data
-            l, loss_array = self.loss(output, target, self.epoch)
+            l, loss_array = self.loss(output, target)
 
             if do_backprop:
                 l.backward()
