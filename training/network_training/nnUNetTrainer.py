@@ -68,7 +68,6 @@ class nnUNetTrainer(NetworkTrainer):
         if stage 1 exists then stage 1 is the high resolution stage, otherwise it's 0
         :param unpack_data: if False, npz preprocessed data will not be unpacked to npy. This consumes less space but
         is considerably slower! Running unpack_data=False with 2d should never be done!
-
         IMPORTANT: If you inherit from nnUNetTrainer and the init args change then you need to redefine self.init_args
         in your init accordingly. Otherwise checkpoints won't load properly!
         """
@@ -526,7 +525,7 @@ class nnUNetTrainer(NetworkTrainer):
     def validate(self, do_mirroring: bool = True, use_sliding_window: bool = True, step_size: float = 0.5,
                  save_softmax: bool = True, use_gaussian: bool = True, overwrite: bool = True,
                  validation_folder_name: str = 'validation_raw', debug: bool = False, all_in_gpu: bool = False,
-                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True, includes_laplacian: bool = False):
+                 segmentation_export_kwargs: dict = None, run_postprocessing_on_folds: bool = True):
         """
         if debug=True then the temporary files generated for postprocessing determination will be kept
         """
@@ -592,14 +591,7 @@ class nnUNetTrainer(NetworkTrainer):
                 print(k, data.shape)
                 data[-1][data[-1] == -1] = 0
 
-                #SR change this. Remove last two channels
-                if includes_laplacian:
-                    print("SR debug: Ignoring laplacian channel in data")
-                    image = data[:-2]
-                else:
-                    image = data[:-1]
-
-                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(image,
+                softmax_pred = self.predict_preprocessed_data_return_seg_and_softmax(data[:-1],
                                                                                      do_mirroring=do_mirroring,
                                                                                      mirror_axes=mirror_axes,
                                                                                      use_sliding_window=use_sliding_window,
@@ -615,9 +607,9 @@ class nnUNetTrainer(NetworkTrainer):
                 else:
                     softmax_fname = None
 
-                """There is a problem with python process communication that prevents us from communicating obejcts
+                """There is a problem with python process communication that prevents us from communicating objects
                 larger than 2 GB between processes (basically when the length of the pickle string that will be sent is
-                communicated by the multiprocessing.Pipe object then the placeholder (\%i I think) does not allow for long
+                communicated by the multiprocessing.Pipe object then the placeholder (I think) does not allow for long
                 enough strings (lol). This could be fixed by changing i to l (for long) but that would require manually
                 patching system python code. We circumvent that problem here by saving softmax_pred to a npy file that will
                 then be read (and finally deleted) by the Process. save_segmentation_nifti_from_softmax can take either
@@ -716,9 +708,6 @@ class nnUNetTrainer(NetworkTrainer):
         self.online_eval_fp = np.sum(self.online_eval_fp, 0)
         self.online_eval_fn = np.sum(self.online_eval_fn, 0)
 
-        print(self.online_eval_tp)
-        print(self.online_eval_fp)
-        print(self.online_eval_fn)
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in
                                            zip(self.online_eval_tp, self.online_eval_fp, self.online_eval_fn)]
                                if not np.isnan(i)]
