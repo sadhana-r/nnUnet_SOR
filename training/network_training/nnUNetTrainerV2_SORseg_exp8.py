@@ -510,11 +510,6 @@ class nnUNetTrainerV2_SORseg_exp8(nnUNetTrainer):
         self.network.update_epoch(self.epoch)
         torch.autograd.set_detect_anomaly(True)
 
-        #In the last 20 epochs, increase the number of SOR iterations
-        if self.epoch >= 230:
-            print("Increasing number of SOR iterations to 120")
-            self.network.update_SORiterations(120)
-
         if self.fp16:
             with autocast():
                 output = self.network(data)
