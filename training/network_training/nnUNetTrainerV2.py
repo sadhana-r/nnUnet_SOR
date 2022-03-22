@@ -236,10 +236,6 @@ class nnUNetTrainerV2(nnUNetTrainer):
         data = maybe_to_torch(data)
         target = maybe_to_torch(target)
 
-        print("seg shape")
-        for seg in target:
-            print(seg.shape)
-
         if torch.cuda.is_available():
             data = to_cuda(data)
             target = to_cuda(target)
@@ -249,9 +245,6 @@ class nnUNetTrainerV2(nnUNetTrainer):
         if self.fp16:
             with autocast():
                 output = self.network(data)
-                print("data shape")
-                for p in output:
-                    print(p.shape)
                 del data
                 l = self.loss(output, target)
 
