@@ -16,9 +16,9 @@ import torch
 from torch import nn
 import numpy as np
 import nibabel as nib
-#from nnunet.utilities.one_hot_encoding import to_one_hot
+from nnunet.utilities.nd_softmax import softmax_helper
 import torch.nn.functional as F
-
+from nnunet.training.loss_functions.dice_loss import FocalTverskyLoss
 
 """
 Moved this code to the network. Dont need it here
@@ -149,9 +149,12 @@ class MultipleOutputLoss2_SOR_DSC(nn.Module):
         self.lambda_weight = lambda_weight
 
         self.sor_start_epoch = sor_start_epoch
-
+        
         self.bnd = 15
 
+        #Try using tversky loss on Laplacian seg
+        self.focaltversky = FocalTverskyLoss(apply_nonlin=softmax_helper) 
+    
     def update_lambda(self, lambda_weight):
         self.lambda_weight = lambda_weight
 
@@ -186,16 +189,17 @@ class MultipleOutputLoss2_SOR_DSC(nn.Module):
             t_predseg = t_predseg[:,:,self.bnd:-self.bnd, self.bnd:-self.bnd, self.bnd:-self.bnd]
 
             #For checking outputs - save a few patch outputs
-            output_file = '/data/sadhanar/groundtruth_seg' + str(r) + '.nii.gz'
+            output_file = '/data/sadhanar/groundtruth_exp9_seg' + str(r) + '.nii.gz'
             laplace = torch.swapaxes(t_gt.squeeze(),0,3)
             nib.save(nib.Nifti1Image(laplace.cpu().numpy(), np.eye(4)),output_file)
 
-            output_file = '/data/sadhanar/pred_seg' + str(r) + '.nii.gz'
+            output_file = '/data/sadhanar/pred_exp9_seg' + str(r) + '.nii.gz'
             laplace = torch.swapaxes(t_predseg.argmax(1).squeeze(),0,3)
             nib.save(nib.Nifti1Image(laplace.detach().cpu().numpy(), np.eye(4)),output_file)
 
-            # Compute average MSE loss over pixels included in the gm.
+            # Compute DCandCE loss/FocalTversky over pixels included in the gm.
             t_loss = self.loss(t_predseg,t_gt)
+            #t_loss = self.focaltversky(t_predseg,t_gt)
 
             x = x[2:]
 
@@ -223,7 +227,7 @@ class MultipleOutputLoss2_SOR_DSC(nn.Module):
         #Return either both loss summed together or just segmentation loss
         if epoch > self.sor_start_epoch:
             loss_array = torch.tensor([l, t_loss])
-            l = l + t_loss
+            l = (1- self.lambda_weight)*l + self.lambda_weight*t_loss
         else:
             loss_array = torch.tensor([l, 0])
 
