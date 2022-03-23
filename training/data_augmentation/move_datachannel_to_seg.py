@@ -5,30 +5,7 @@
 import torch
 from batchgenerators.transforms.abstract_transforms import AbstractTransform
 import numpy as np
-
-def doublesigmoid_threshold(data, lower_lim, upper_lim):
-    
-    steepness = 10
-    
-    lower_thresh = 1/(1 + torch.exp(-steepness*(data - lower_lim)))
-    upper_thresh = 1/(1 + torch.exp(steepness*(data - upper_lim)))
-    
-    output = torch.mul(lower_thresh,upper_thresh)
-    output = output.squeeze()
-                      
-    return output
-
-def convert_laplacian_toseg(data):
-    
-    data = torch.from_numpy(data)
-    thresholds = [-0.1,0.1, 0.3, 0.5, 0.7, 0.9]
-    shape = (data.shape[0],len(thresholds), *data.shape[2:])
-    result = torch.zeros(shape, dtype=data.dtype) 
-    for i, l in enumerate(thresholds): 
-        output = doublesigmoid_threshold(data, l,l+0.3)
-        result[:,i] = output
-                
-    return result.numpy()
+from nnunet.utilities.convert_laplacian_to_seg import convert_laplacian_toseg
 
 class MoveLaplaceToSeg(AbstractTransform):
         '''
@@ -49,7 +26,8 @@ class MoveLaplaceToSeg(AbstractTransform):
 
             if self.laplace_seg:
                 #Convert to seg one hot
-                laplace_onehot = convert_laplacian_toseg(laplace)
+                laplace = torch.from_numpy(laplace)
+                laplace_onehot = convert_laplacian_toseg(laplace).numpy()
                 laplace_multilabel = laplace_onehot.argmax(1)
                 laplace_multilabel = laplace_multilabel[:,None, :]
                 target = np.concatenate((target, laplace_multilabel), 1)
