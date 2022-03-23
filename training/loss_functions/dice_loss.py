@@ -155,6 +155,50 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
     return tp, fp, fn, tn
 
 
+class FocalTverskyLoss(nn.Module):
+    def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1.):
+        """
+        """
+        super(FocalTverskyLoss, self).__init__()
+
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+        self.alpha = 0.7
+
+        #If I set gamama > 1, then the network will focus on hard examples. Try 4/3 as in paper
+        #self.gamma = 0.75
+        self.gamma = 4/3
+
+    def forward(self, x, y, loss_mask=None):
+        shp_x = x.shape
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x, y, axes, loss_mask, False)
+
+        nominator = tp + self.smooth
+        denominator = tp + (1-self.alpha)*fp + self.alpha*fn + self.smooth
+
+        tl = nominator / (denominator + 1e-8)
+
+        if not self.do_bg:
+            if self.batch_dice:
+                tl = tl[1:]
+            else:
+                tl = tl[:, 1:]
+        tl = tl.mean()
+
+        return torch.pow((1-tl), self.gamma)
+
+
 class SoftDiceLoss(nn.Module):
     def __init__(self, apply_nonlin=None, batch_dice=False, do_bg=True, smooth=1.):
         """
